@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SIT Chatbot</title>
+    <meta name="description" content="Chat with SIT's friendly otter assistant" />
+    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="icon" type="image/png" href="/static/sit-data/logo.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+<!-- Status indicators -->
+<div id="connectionStatus" class="status-badge hidden">Disconnected</div>
+
+<div class="chat-container">
+    <!-- Main Chat Interface -->
+    <div class="chat-interface">
+        <!-- Left Panel: Chat and Controls -->
+        <div class="chat-card">
+            <div class="card-header">
+                <div class="header-logo">
+                    <img src="static/sit-data/logo.png" alt="Singapore Institute of Technology Logo" class="sit-logo">
+                </div>
+                <div class="header-text">
+                    <h2>SIT Assistant</h2>
+                    <p>Your intelligent SIT companion</p>
+                </div>
+            </div>
+
+            <!-- Chat Messages Area -->
+            <div class="chat-messages" id="chatMessages">
+                <div class="welcome-message">
+                    <div class="message bot-message">
+                        <div class="message-content">
+                            👋 Hello! I'm your SIT assistant. I can help you with information about courses, facilities, events, and more. How can I assist you today?
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Modern Input Area -->
+            <div class="input-container">
+                <!-- Status indicator -->
+                <div id="statusIndicator" class="status-indicator">
+                    <div class="status-dot" id="statusDot"></div>
+                    <span id="statusText">Ready to help</span>
+                </div>
+
+                <!-- Primary Action Button -->
+                <button id="primaryActionButton" class="primary-action-button">
+                    <svg id="buttonIcon" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="10"/>
+                        <polygon points="10 8 16 12 10 16 10 8"/>
+                    </svg>
+                    <span id="buttonText">Start Conversation</span>
+                </button>
+
+                <!-- Secondary Action Button -->
+                <button id="secondaryActionButton" class="secondary-action-button hidden">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="22" y1="2" x2="11" y2="13"></line>
+                        <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                    </svg>
+                    <span id="secondaryButtonText">Send Message</span>
+                </button>
+
+                <!-- Text Input Alternative -->
+                <div id="textInputContainer" class="text-input-container hidden">
+                    <input type="text" id="textInput" class="text-input" placeholder="Type your message here..." />
+                    <button id="sendTextButton" class="send-button">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="22" y1="2" x2="11" y2="13"></line>
+                            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                        </svg>
+                    </button>
+                </div>
+
+                <!-- Input Mode Toggle -->
+                <div class="input-mode-toggle">
+                    <button id="voiceModeBtn" class="mode-btn active">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                            <line x1="12" y1="19" x2="12" y2="23"></line>
+                            <line x1="8" y1="23" x2="16" y2="23"></line>
+                        </svg>
+                        Voice
+                    </button>
+                    <button id="textModeBtn" class="mode-btn">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                            <polyline points="14 2 14 8 20 8"></polyline>
+                            <line x1="16" y1="13" x2="8" y2="13"></line>
+                            <line x1="16" y1="17" x2="8" y2="17"></line>
+                            <polyline points="10 9 9 9 8 9"></polyline>
+                        </svg>
+                        Type
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right Panel: Avatar -->
+        <div class="avatar-card">
+            <div id="animatedAvatar" class="avatar-wrapper">
+                <!-- Otter Avatar SVG will be inserted here by JavaScript -->
+            </div>
+
+            <!-- Speaking Indicator -->
+            <div id="speakingIndicator" class="speaking-indicator hidden">
+                <div class="speaking-wave"></div>
+                <div class="speaking-wave"></div>
+                <div class="speaking-wave"></div>
+                <span>Speaking...</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="/static/bundle.js"></script>
+</body>
+</html>
