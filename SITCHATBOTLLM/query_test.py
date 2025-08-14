@@ -17,6 +17,12 @@ import json
 import time
 import lancedb
 from langchain.callbacks.base import BaseCallbackHandler
+from concurrent.futures import ThreadPoolExecutor
+import tiktoken
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
+rerank_embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
 
 class TimingStreamingCallbackHandler(BaseCallbackHandler):
@@ -132,46 +138,53 @@ def expand_query_with_abbreviations(query):
 
 
 def truncate_context_to_token_limit(docs, max_tokens=2500, chunk_token_limit=800):
+    """
+    Build context by interleaving chunks from multiple documents.
+    Each document is split into chunks of chunk_token_limit.
+    Chunks are added in round-robin until max_tokens is reached.
+    """
     enc = tiktoken.get_encoding("cl100k_base")
-    context = ""
     token_count = 0
+    context_chunks = []
 
+    # split all docs into chunks
+    all_chunks = []
     for i, doc in enumerate(docs):
-        program = doc.metadata.get('program', 'Unknown Program')  # fallback if not present
+        program = doc.metadata.get('program', 'Unknown Program')
         prefix = f"--- Source: {doc.metadata.get('source', 'unknown').upper()} | Program: {program} ---\n"
-
-        raw_text = doc.page_content.strip()
-        if len(raw_text) < 100:
-            continue  # Skip too short
-
-        tokens = enc.encode(raw_text)
-
-        if len(tokens) == 0:
-            print(f"⚠️ Skipped empty doc #{i + 1}")
-            continue
-
-        # Split long documents into smaller chunks
+        tokens = enc.encode(doc.page_content.strip())
         start = 0
         while start < len(tokens):
             end = min(start + chunk_token_limit, len(tokens))
             chunk_tokens = tokens[start:end]
             chunk_text = prefix + enc.decode(chunk_tokens)
-            chunk_len = len(chunk_tokens)
-
-            if chunk_len > max_tokens:
-                print(f"⚠️ Skipping doc #{i + 1} because one chunk exceeds token limit ({chunk_len} tokens).")
-                break
-
-            if token_count + chunk_len > max_tokens:
-                print(f"🚫 Truncation reached at chunk of doc #{i + 1}. Total tokens: {token_count}")
-                return context
-
-            context += chunk_text + "\n\n"
-            token_count += chunk_len
+            all_chunks.append({
+                "text": chunk_text,
+                "token_len": len(chunk_tokens)
+            })
             start = end
 
+    # interleave chunks round-robin style
+    # Sort chunks by original doc index to preserve ordering per doc
+    # Then pick one chunk from each doc iteratively
+    from collections import defaultdict, deque
+
+    doc_chunk_map = defaultdict(deque)
+    for chunk in all_chunks:
+        doc_chunk_map[chunk['text']].append(chunk)
+
+    # Flatten into a queue for round-robin interleaving
+    chunk_queue = deque(all_chunks)
+    while chunk_queue and token_count < max_tokens:
+        chunk = chunk_queue.popleft()
+        if token_count + chunk['token_len'] > max_tokens:
+            break
+        context_chunks.append(chunk['text'])
+        token_count += chunk['token_len']
+
+    final_context = "\n\n".join(context_chunks)
     print(f"🧮 Final token count in context: {token_count}")
-    return context
+    return final_context
 
 
 def generate_response_from_context(query, context, retrieval_end_time):
@@ -213,41 +226,50 @@ def generate_response_from_context(query, context, retrieval_end_time):
     response = model.invoke(prompt_messages)
     print("\n\n✅ Streaming finished.")
     return response.content
-#------------------------------------ Use this to stream to elevenLabs ------------------------------------#
-    # class TokenStreamer(BaseCallbackHandler):
-    #     def __init__(self):
-    #         self.first_token_reported = False
-    #         self.retrieval_end_time = retrieval_end_time
-    #
-    #     def on_llm_new_token(self, token: str, **kwargs):
-    #         if not self.first_token_reported:
-    #             first_token_time = time.time()
-    #             latency = first_token_time - self.retrieval_end_time
-    #             print(f"\n First token streamed at: {time.strftime('%X')} (Latency after retrieval: {latency:.3f}s)\n")
-    #             self.first_token_reported = True
-    #         yield token
-    #
-    # streamer = TokenStreamer()
-    #
-    # model = ChatOpenAI(
-    #     model_name="gpt-4.1-mini",
-    #     temperature=0.2,
-    #     streaming=True,
-    #     callbacks=[streamer]
-    # )
-    # return model.stream(prompt_messages)
-#---------------------------------------------------------------------------------------------------------------------------#
 
     # model = ChatOpenAI(model_name="gpt-4.1-mini", temperature=0.2)
     # return model.invoke(prompt_messages).content
 import time  # Make sure this is imported at the top
 
 
+def truncate_for_rerank(text, token_limit=2000):
+    enc = tiktoken.get_encoding("cl100k_base")
+    tokens = enc.encode(text)
+    return enc.decode(tokens[:token_limit])
+
+
+def safe_embed_document_local(text, chunk_token_limit=2000):
+    """Split long docs into smaller chunks, embed locally, and average."""
+    enc = tiktoken.get_encoding("cl100k_base")
+    tokens = enc.encode(text)
+
+    if len(tokens) <= chunk_token_limit:
+        return rerank_embedder.encode(text)
+
+    # Split into chunks
+    chunks = []
+    start = 0
+    while start < len(tokens):
+        end = min(start + chunk_token_limit, len(tokens))
+        chunks.append(enc.decode(tokens[start:end]))
+        start = end
+
+    # Embed each chunk and average
+    chunk_embeddings = rerank_embedder.encode(chunks)
+    return np.mean(chunk_embeddings, axis=0)
+
+def batch_embed_documents_parallel_local(docs, max_workers=5):
+    """Embed multiple documents in parallel locally."""
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        embeddings = list(executor.map(safe_embed_document_local, docs))
+    return embeddings
+
+
 def query_faiss(query):
     if not query.strip():
         return "Please enter a question."
 
-    total_start = time.time()  # ⏱️ Start overall timing
+    total_start = time.time()
 
     print(f"❓ Original Query: {query}")
 
@@ -258,23 +280,14 @@ def query_faiss(query):
     print(f"⏱️ Query rewrite took {time.time() - step_start:.2f}s")
 
     bm25_keywords = rewritten.strip()
-    print(f"🔑 Rewritten BM25 Query: {bm25_keywords}")
-
-    bm25_priority = any(
-        x.lower() in query.lower()
-        for x in ["miao", "xiaoxiao", "lee", "benjamin", "soon", "chong", "li", "zhang", "prof", "dr."]
-    )
 
     cleaned_query = preprocess_query(rewritten)
     sit_bias_keywords = " Singapore Institute of Technology SIT university campus students programs"
     cleaned_query += sit_bias_keywords
-    if any(x in query.lower() for x in ["get to", "directions", "location", "where is"]):
-        cleaned_query += " address map transportation MRT bus"
 
     print("🔍 Running FAISS vector search...")
     step_start = time.time()
-    query_to_use = query if bm25_priority else cleaned_query
-    query_vector = embedder.embed_query(query_to_use)
+    query_vector = embedder.embed_query(cleaned_query)
     results = lance_table.search(query_vector, vector_column_name="vector").limit(10).to_list()
     raw_faiss_docs = [
         Document(
@@ -283,20 +296,13 @@ def query_faiss(query):
         )
         for row in results
     ]
-    # raw_faiss_docs = vectorstore.similarity_search_by_vector(query_vector, k=10)
     print(f"⏱️ FAISS retrieval took {time.time() - step_start:.2f}s")
 
-    step_start = time.time()
     deduped_faiss_docs = dedup_documents(raw_faiss_docs)
-    for doc in deduped_faiss_docs:
-        doc.metadata["source"] = "faiss"
 
-    print("🔍 Running BM25 assist...")
+    print("🔍 Running BM25 search...")
     step_start = time.time()
     bm25_results = search_bm25(bm25_keywords, top_n=10)
-    print(f"⏱️ BM25 search took {time.time() - step_start:.2f}s")
-
-    step_start = time.time()
     bm25_docs = [
         Document(
             page_content=doc["content"],
@@ -304,109 +310,55 @@ def query_faiss(query):
         )
         for doc in bm25_results
     ]
-    print("\n🗂 Top BM25 docs preview:")
-    for i, doc in enumerate(bm25_docs[:5]):
-        print(f"{i + 1}. {doc.page_content[:200].strip()}...\n")
+    print(f"⏱️ BM25 search took {time.time() - step_start:.2f}s")
 
+    # Merge & deduplicate
     desired_total = 20
-    bm25_limit = 10
-    deduped_faiss_docs = dedup_documents(raw_faiss_docs)
+    seen_texts = set()
+    combined_docs = []
+
     for doc in deduped_faiss_docs:
-        doc.metadata["source"] = "faiss"
+        txt = doc.page_content.strip().lower()
+        if txt not in seen_texts:
+            combined_docs.append(doc)
+            seen_texts.add(txt)
 
-    num_faiss = min(len(deduped_faiss_docs), desired_total)
-    selected_faiss = deduped_faiss_docs[:num_faiss]
-
-    seen_texts = set(doc.page_content.strip().lower() for doc in selected_faiss)
-    bm25_dedup = []
     for doc in bm25_docs:
-        content = doc.page_content.strip().lower()
-        if content not in seen_texts and len(bm25_dedup) < (desired_total - num_faiss):
-            bm25_dedup.append(doc)
-            seen_texts.add(content)
+        txt = doc.page_content.strip().lower()
+        if txt not in seen_texts and len(combined_docs) < desired_total:
+            combined_docs.append(doc)
+            seen_texts.add(txt)
 
-    unique_docs = selected_faiss + bm25_dedup
+    print(f"✅ Combined {len(combined_docs)} docs before reranking.")
 
-    print(f"✅ Combined {len(unique_docs)} documents from FAISS + BM25.")
-    faiss_count = sum(1 for d in unique_docs if d.metadata.get("source") == "faiss")
-    bm25_count = sum(1 for d in unique_docs if d.metadata.get("source") == "bm25")
-    print(f"📊 Doc breakdown — FAISS: {faiss_count}, BM25: {bm25_count}")
-    print(f"✅ Combined {len(unique_docs)} unique documents from FAISS + BM25.")
-    print(f"⏱️ Merge & dedup took {time.time() - step_start:.2f}s")
+    # ✅ Rerank with cosine similarity
+    print("📊 Reranking with cosine similarity...")
+    docs_for_rerank = [truncate_for_rerank(doc.page_content) for doc in combined_docs]
+    doc_embeddings = batch_embed_documents_parallel_local(docs_for_rerank, max_workers=5)
 
-    context_build_end = time.time()
-    context = truncate_context_to_token_limit(unique_docs)
-    print(f"⏱️ Context building took {time.time() - context_build_end:.2f}s")
+    query_vector_local = rerank_embedder.encode(truncate_for_rerank(cleaned_query, 1000))
 
-    print("\n🧠 Final context passed to LLM:\n", context)
+    # Compute cosine similarity and sort
+    sims = cosine_similarity([query_vector_local], doc_embeddings)[0]
+    scored_docs = list(zip(combined_docs, sims))
+    scored_docs.sort(key=lambda x: x[1], reverse=True)
+    reranked_docs = [doc for doc, _ in scored_docs]
+
+    print("Top 5 reranked docs preview:")
+    for i, (doc, score) in enumerate(scored_docs[:5]):
+        print(f"{i + 1}. ({score:.4f}) {doc.page_content[:150]}...\n")
+
+    # Build context after reranking
+    context_build_start = time.time()
+    context = truncate_context_to_token_limit(reranked_docs)
+    print(f"⏱️ Context building took {time.time() - context_build_start:.2f}s")
 
     retrieval_end_time = time.time()
     response = generate_response_from_context(query, context, retrieval_end_time)
-    print(f"⏱️ LLM response took {time.time() - retrieval_end_time:.2f}s")
-
-    # step_start = time.time()
-    # context = truncate_context_to_token_limit(unique_docs)
-    # print(f"⏱️ Context building took {time.time() - step_start:.2f}s")
-    #
-    # print("\n🧠 Final context passed to LLM:\n", context)
-    #
-    # step_start = time.time()
-    # response = generate_response_from_context(query, context)
-    # print(f"⏱️ LLM response took {time.time() - step_start:.2f}s")
 
     print(f"✅ Total query time: {time.time() - total_start:.2f}s")
     return response
 
-#-------------------------------------------- Use this to stream to elevenlabs --------------------------------------------#
-# def query_faiss_stream(query):
-#     if not query.strip():
-#         yield "Please enter a question."
-#         return
-#
-#     total_start = time.time()
-#     print(f"Original Query: {query}")
-#
-#     expanded_query = expand_query_with_abbreviations(query)
-#     rewritten = rewrite_chain.invoke({"query": expanded_query})
-#     print(f"Rewritten for LLM (with expansions): {rewritten}")
-#
-#     cleaned_query = preprocess_query(rewritten)
-#     sit_bias_keywords = " Singapore Institute of Technology SIT university campus students programs"
-#     cleaned_query += sit_bias_keywords
-#
-#     if any(x in query.lower() for x in ["get to", "directions", "location", "where is"]):
-#         cleaned_query += " address map transportation MRT bus"
-#
-#     query_vector = embedder.embed_query(cleaned_query)
-#     results = lance_table.search(query_vector, vector_column_name="vector").limit(10).to_list()
-#     raw_faiss_docs = [
-#         Document(
-#             page_content=row.get("text", ""),
-#             metadata=row.get("metadata", {}) | {"source": "faiss"}
-#         )
-#         for row in results
-#     ]
-#     deduped_faiss_docs = dedup_documents(raw_faiss_docs)
-#
-#     bm25_results = search_bm25(rewritten, top_n=10)
-#     bm25_docs = [
-#         Document(
-#             page_content=doc["content"],
-#             metadata={"source": "bm25", **doc.get("metadata", {})}
-#         )
-#         for doc in bm25_results
-#     ]
-#
-#     unique_docs = deduped_faiss_docs + bm25_docs
-#     context = truncate_context_to_token_limit(unique_docs)
-#
-#     print("\nFinal context passed to LLM:\n", context)
-#     retrieval_end_time = time.time()
-#
-#     # Yield tokens from LLM stream
-#     for token in generate_response_from_context_stream(query, context, retrieval_end_time):
-#         yield token
-#--------------------------------------------------------------------------------------------------------------------------#
 # Main interactive loop
 if __name__ == "__main__":
     print("Test FAISS index (type 'exit' to quit):")
