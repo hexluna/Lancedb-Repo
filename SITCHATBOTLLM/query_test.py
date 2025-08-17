@@ -24,6 +24,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from collections import defaultdict
 from datetime import datetime
+from nltk.tokenize import sent_tokenize
+
 bi_encoder = SentenceTransformer("all-MiniLM-L6-v2")
 cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 _embedding_cache = {}
@@ -140,56 +142,6 @@ def expand_query_with_abbreviations(query):
     return query
 
 
-def truncate_context_to_token_limit(docs, max_tokens=5000, chunk_token_limit=1000):
-    """
-    Build context by interleaving chunks from multiple documents.
-    Each document is split into chunks of chunk_token_limit.
-    Chunks are added in round-robin until max_tokens is reached.
-    """
-    enc = tiktoken.get_encoding("cl100k_base")
-    token_count = 0
-    context_chunks = []
-
-    # split all docs into chunks
-    all_chunks = []
-    for i, doc in enumerate(docs):
-        program = doc.metadata.get('program', 'Unknown Program')
-        prefix = f"--- Source: {doc.metadata.get('source', 'unknown').upper()} | Program: {program} ---\n"
-        tokens = enc.encode(doc.page_content.strip())
-        start = 0
-        while start < len(tokens):
-            end = min(start + chunk_token_limit, len(tokens))
-            chunk_tokens = tokens[start:end]
-            chunk_text = prefix + enc.decode(chunk_tokens)
-            all_chunks.append({
-                "text": chunk_text,
-                "token_len": len(chunk_tokens)
-            })
-            start = end
-
-    # interleave chunks round-robin style
-    # Sort chunks by original doc index to preserve ordering per doc
-    # Then pick one chunk from each doc iteratively
-    from collections import defaultdict, deque
-
-    doc_chunk_map = defaultdict(deque)
-    for chunk in all_chunks:
-        doc_chunk_map[chunk['text']].append(chunk)
-
-    # Flatten into a queue for round-robin interleaving
-    chunk_queue = deque(all_chunks)
-    while chunk_queue and token_count < max_tokens:
-        chunk = chunk_queue.popleft()
-        if token_count + chunk['token_len'] > max_tokens:
-            break
-        context_chunks.append(chunk['text'])
-        token_count += chunk['token_len']
-
-    final_context = "\n\n".join(context_chunks)
-    print(f"🧮 Final token count in context: {token_count}")
-    return final_context
-
-
 def generate_response_from_context(query, context, retrieval_end_time):
     prompt_messages = [
         SystemMessage(content="""
@@ -229,9 +181,6 @@ def generate_response_from_context(query, context, retrieval_end_time):
     response = model.invoke(prompt_messages)
     print("\n\n✅ Streaming finished.")
     return response.content
-
-    # model = ChatOpenAI(model_name="gpt-4.1-mini", temperature=0.2)
-    # return model.invoke(prompt_messages).content
 import time  # Make sure this is imported at the top
 
 
@@ -245,6 +194,67 @@ ABBREVIATION_GLOSSARY = {
     "NLP": "Natural Language Processing"
 }
 
+def truncate_context_to_token_limit(docs, max_tokens=5000, chunk_token_limit=1000):
+    """
+    Split documents into semantic chunks (by paragraph/sentence) while respecting token limits.
+    Then interleave chunks round-robin style until max_tokens is reached.
+    """
+    enc = tiktoken.get_encoding("cl100k_base")
+    token_count = 0
+    context_chunks = []
+
+    all_chunks = []
+    for doc in docs:
+        program = doc.metadata.get('program', 'Unknown Program')
+        prefix = f"--- Source: {doc.metadata.get('source', 'unknown').upper()} | Program: {program} ---\n"
+
+        # use paragraphs first, if too long, fallback to sentences
+        paragraphs = [p for p in doc.page_content.split("\n\n") if p.strip()]
+        for para in paragraphs:
+            para_tokens = enc.encode(para.strip())
+            if len(para_tokens) <= chunk_token_limit:
+                all_chunks.append({
+                    "text": prefix + para.strip(),
+                    "token_len": len(para_tokens)
+                })
+            else:
+                # split long paragraph into sentences
+                sentences = sent_tokenize(para)
+                current_chunk = ""
+                current_len = 0
+                for sent in sentences:
+                    sent_tokens = enc.encode(sent)
+                    if current_len + len(sent_tokens) > chunk_token_limit:
+                        if current_chunk:
+                            all_chunks.append({
+                                "text": prefix + current_chunk.strip(),
+                                "token_len": current_len
+                            })
+                        current_chunk = sent
+                        current_len = len(sent_tokens)
+                    else:
+                        current_chunk += " " + sent
+                        current_len += len(sent_tokens)
+                if current_chunk:
+                    all_chunks.append({
+                        "text": prefix + current_chunk.strip(),
+                        "token_len": current_len
+                    })
+
+    # round-robin interleaving
+    from collections import deque
+    chunk_queue = deque(all_chunks)
+    while chunk_queue and token_count < max_tokens:
+        chunk = chunk_queue.popleft()
+        if token_count + chunk['token_len'] > max_tokens:
+            break
+        context_chunks.append(chunk['text'])
+        token_count += chunk['token_len']
+
+    final_context = "\n\n".join(context_chunks)
+    print(f"🧮 Final token count in context: {token_count}")
+    return final_context
+
 def auto_expand_abbreviations(query: str) -> str:
     words = query.split()
     expanded_words = [
@@ -252,29 +262,6 @@ def auto_expand_abbreviations(query: str) -> str:
         for w in words
     ]
     return " ".join(expanded_words)
-
-def reciprocal_rank_fusion(results_list, k=60):
-    scores = defaultdict(float)
-    doc_map = {}
-
-    for results in results_list:
-        for rank, doc in enumerate(results):
-            key = doc.page_content.strip().lower()
-            scores[key] += 1 / (k + rank + 1)
-            if key not in doc_map:
-                doc_map[key] = doc
-
-    # Sort by score, highest first
-    ranked_keys = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return [doc_map[key] for key, _ in ranked_keys]
-
-def batch_embed_texts(texts):
-    uncached = [t for t in texts if t not in _embedding_cache]
-    if uncached:
-        vectors = bi_encoder.encode(uncached, show_progress_bar=False)
-        for t, vec in zip(uncached, vectors):
-            _embedding_cache[t] = vec
-    return np.array([_embedding_cache[t] for t in texts])
 
 def compute_metadata_score(metadata):
     score = 0
@@ -297,10 +284,33 @@ def parallel_retrieve(query):
         bm25_results = future_bm25.result()
     return faiss_results, bm25_results
 
-def truncate_for_rerank(text, token_limit=2000):
-    enc = tiktoken.get_encoding("cl100k_base")
-    tokens = enc.encode(text)
-    return enc.decode(tokens[:token_limit])
+def rerank_semantic_docs(query, docs):
+    """
+    Rerank semantic-aware chunks using CrossEncoder and optional metadata scores.
+    """
+    seen_texts = set()
+    unique_docs = []
+    for doc in docs:
+        txt = doc.page_content.strip().lower()
+        if txt not in seen_texts:
+            unique_docs.append(doc)
+            seen_texts.add(txt)
+
+    texts = [doc.page_content for doc in unique_docs]
+    pairs = [(query, t) for t in texts]
+
+    scores = cross_encoder.predict(pairs)  # [batch_size] float array
+
+    scores = [s + compute_metadata_score(doc.metadata) for s, doc in zip(scores, unique_docs)]
+
+    reranked_docs = [doc for _, doc in sorted(zip(scores, unique_docs), key=lambda x: x[0], reverse=True)]
+
+    print("\nTop Reranked Semantic Chunks:")
+    for i, doc in enumerate(reranked_docs[:5], start=1):
+        snippet = doc.page_content[:200].replace("\n", " ")
+        print(f"{i}. [Source: {doc.metadata.get('source', 'unknown')}] {snippet}...\n")
+
+    return reranked_docs
 
 #--------------------------------- Helpers for query_faiss ---------------------------------#
 
@@ -329,25 +339,8 @@ def query_faiss(query):
     for d in faiss_docs[:5]:
         print(d.page_content[:200], "...\n")
 
-    # combined_docs = round_robin_merge(faiss_docs, bm25_docs)
-    combined_docs = reciprocal_rank_fusion([faiss_docs, bm25_docs])
-    seen_texts = set()
-    unique_docs = []
-    for doc in combined_docs:
-        txt = doc.page_content.strip().lower()
-        if txt not in seen_texts:
-            unique_docs.append(doc)
-            seen_texts.add(txt)
-
-    texts = [doc.page_content for doc in unique_docs]
-    pairs = [(rewritten, t) for t in texts]
-    scores = cross_encoder.predict(pairs)
-    scores = [s + compute_metadata_score(doc.metadata) for s, doc in zip(scores, unique_docs)]
-    reranked_docs = [doc for _, doc in sorted(zip(scores, unique_docs), key=lambda x: x[0], reverse=True)]
-    print("\nTop Reranked Documents:")
-    for i, doc in enumerate(reranked_docs[:5], start=1):  # limit to top 5 for readability
-        snippet = doc.page_content[:200].replace("\n", " ")
-        print(f"{i}. [Source: {doc.metadata.get('source', 'unknown')}] {snippet}...\n")
+    combined_docs = faiss_docs + bm25_docs
+    reranked_docs = rerank_semantic_docs(rewritten, combined_docs)
 
     context = truncate_context_to_token_limit(reranked_docs)
 
