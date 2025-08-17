@@ -21,9 +21,12 @@ from concurrent.futures import ThreadPoolExecutor
 import tiktoken
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-from sentence_transformers import SentenceTransformer
-rerank_embedder = SentenceTransformer("all-MiniLM-L6-v2")
-
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from collections import defaultdict
+from datetime import datetime
+bi_encoder = SentenceTransformer("all-MiniLM-L6-v2")
+cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+_embedding_cache = {}
 
 class TimingStreamingCallbackHandler(BaseCallbackHandler):
     def __init__(self, retrieval_end_time):
@@ -137,7 +140,7 @@ def expand_query_with_abbreviations(query):
     return query
 
 
-def truncate_context_to_token_limit(docs, max_tokens=2500, chunk_token_limit=800):
+def truncate_context_to_token_limit(docs, max_tokens=5000, chunk_token_limit=1000):
     """
     Build context by interleaving chunks from multiple documents.
     Each document is split into chunks of chunk_token_limit.
@@ -232,38 +235,74 @@ def generate_response_from_context(query, context, retrieval_end_time):
 import time  # Make sure this is imported at the top
 
 
+
+#--------------------------------- Helpers for query_faiss ---------------------------------#
+ABBREVIATION_GLOSSARY = {
+    "LLM": "Large Language Model",
+    "RAG": "Retrieval-Augmented Generation",
+    "BM25": "Best Matching 25",
+    "FAISS": "Facebook AI Similarity Search",
+    "NLP": "Natural Language Processing"
+}
+
+def auto_expand_abbreviations(query: str) -> str:
+    words = query.split()
+    expanded_words = [
+        f"{w} ({ABBREVIATION_GLOSSARY[w.upper()]})" if w.upper() in ABBREVIATION_GLOSSARY else w
+        for w in words
+    ]
+    return " ".join(expanded_words)
+
+def reciprocal_rank_fusion(results_list, k=60):
+    scores = defaultdict(float)
+    doc_map = {}
+
+    for results in results_list:
+        for rank, doc in enumerate(results):
+            key = doc.page_content.strip().lower()
+            scores[key] += 1 / (k + rank + 1)
+            if key not in doc_map:
+                doc_map[key] = doc
+
+    # Sort by score, highest first
+    ranked_keys = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [doc_map[key] for key, _ in ranked_keys]
+
+def batch_embed_texts(texts):
+    uncached = [t for t in texts if t not in _embedding_cache]
+    if uncached:
+        vectors = bi_encoder.encode(uncached, show_progress_bar=False)
+        for t, vec in zip(uncached, vectors):
+            _embedding_cache[t] = vec
+    return np.array([_embedding_cache[t] for t in texts])
+
+def compute_metadata_score(metadata):
+    score = 0
+    if "date" in metadata:
+        try:
+            doc_date = datetime.strptime(metadata["date"], "%Y-%m-%d")
+            days_diff = (datetime.now() - doc_date).days
+            score += max(0, (365 - days_diff) / 365)
+        except:
+            pass
+    if "reliability" in metadata:
+        score += float(metadata["reliability"]) * 0.1
+    return score
+
+def parallel_retrieve(query):
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_faiss = executor.submit(lambda q: lance_table.search(embedder.embed_query(q), vector_column_name="vector").limit(10).to_list(), query)
+        future_bm25 = executor.submit(search_bm25, query, 10)
+        faiss_results = future_faiss.result()
+        bm25_results = future_bm25.result()
+    return faiss_results, bm25_results
+
 def truncate_for_rerank(text, token_limit=2000):
     enc = tiktoken.get_encoding("cl100k_base")
     tokens = enc.encode(text)
     return enc.decode(tokens[:token_limit])
 
-
-def safe_embed_document_local(text, chunk_token_limit=2000):
-    """Split long docs into smaller chunks, embed locally, and average."""
-    enc = tiktoken.get_encoding("cl100k_base")
-    tokens = enc.encode(text)
-
-    if len(tokens) <= chunk_token_limit:
-        return rerank_embedder.encode(text)
-
-    # Split into chunks
-    chunks = []
-    start = 0
-    while start < len(tokens):
-        end = min(start + chunk_token_limit, len(tokens))
-        chunks.append(enc.decode(tokens[start:end]))
-        start = end
-
-    # Embed each chunk and average
-    chunk_embeddings = rerank_embedder.encode(chunks)
-    return np.mean(chunk_embeddings, axis=0)
-
-def batch_embed_documents_parallel_local(docs, max_workers=5):
-    """Embed multiple documents in parallel locally."""
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        embeddings = list(executor.map(safe_embed_document_local, docs))
-    return embeddings
-
+#--------------------------------- Helpers for query_faiss ---------------------------------#
 
 def query_faiss(query):
     if not query.strip():
@@ -275,87 +314,45 @@ def query_faiss(query):
 
     step_start = time.time()
     expanded_query = expand_query_with_abbreviations(query)
+    expanded_query = auto_expand_abbreviations(expanded_query)
     rewritten = rewrite_chain.invoke({"query": expanded_query})
     print(f"✏️ Rewritten for LLM (with expansions): {rewritten}")
     print(f"⏱️ Query rewrite took {time.time() - step_start:.2f}s")
 
-    bm25_keywords = rewritten.strip()
+    faiss_results, bm25_results = parallel_retrieve(rewritten)
+    faiss_docs = [Document(page_content=row.get("text", ""), metadata=row.get("metadata", {}) | {"source": "faiss"}) for
+                  row in faiss_results]
+    bm25_docs = [Document(page_content=doc["content"], metadata={"source": "bm25", **doc.get("metadata", {})}) for doc
+                 in bm25_results]
 
-    cleaned_query = preprocess_query(rewritten)
-    sit_bias_keywords = " Singapore Institute of Technology SIT university campus students programs"
-    cleaned_query += sit_bias_keywords
+    print("\nTop FAISS Docs:")
+    for d in faiss_docs[:5]:
+        print(d.page_content[:200], "...\n")
 
-    print("🔍 Running FAISS vector search...")
-    step_start = time.time()
-    query_vector = embedder.embed_query(cleaned_query)
-    results = lance_table.search(query_vector, vector_column_name="vector").limit(10).to_list()
-    raw_faiss_docs = [
-        Document(
-            page_content=row.get("text", ""),
-            metadata=row.get("metadata", {}) | {"source": "faiss"}
-        )
-        for row in results
-    ]
-    print(f"⏱️ FAISS retrieval took {time.time() - step_start:.2f}s")
-
-    deduped_faiss_docs = dedup_documents(raw_faiss_docs)
-
-    print("🔍 Running BM25 search...")
-    step_start = time.time()
-    bm25_results = search_bm25(bm25_keywords, top_n=10)
-    bm25_docs = [
-        Document(
-            page_content=doc["content"],
-            metadata={"source": "bm25", **doc.get("metadata", {})}
-        )
-        for doc in bm25_results
-    ]
-    print(f"⏱️ BM25 search took {time.time() - step_start:.2f}s")
-
-    # Merge & deduplicate
-    desired_total = 20
+    # combined_docs = round_robin_merge(faiss_docs, bm25_docs)
+    combined_docs = reciprocal_rank_fusion([faiss_docs, bm25_docs])
     seen_texts = set()
-    combined_docs = []
-
-    for doc in deduped_faiss_docs:
+    unique_docs = []
+    for doc in combined_docs:
         txt = doc.page_content.strip().lower()
         if txt not in seen_texts:
-            combined_docs.append(doc)
+            unique_docs.append(doc)
             seen_texts.add(txt)
 
-    for doc in bm25_docs:
-        txt = doc.page_content.strip().lower()
-        if txt not in seen_texts and len(combined_docs) < desired_total:
-            combined_docs.append(doc)
-            seen_texts.add(txt)
+    texts = [doc.page_content for doc in unique_docs]
+    pairs = [(rewritten, t) for t in texts]
+    scores = cross_encoder.predict(pairs)
+    scores = [s + compute_metadata_score(doc.metadata) for s, doc in zip(scores, unique_docs)]
+    reranked_docs = [doc for _, doc in sorted(zip(scores, unique_docs), key=lambda x: x[0], reverse=True)]
+    print("\nTop Reranked Documents:")
+    for i, doc in enumerate(reranked_docs[:5], start=1):  # limit to top 5 for readability
+        snippet = doc.page_content[:200].replace("\n", " ")
+        print(f"{i}. [Source: {doc.metadata.get('source', 'unknown')}] {snippet}...\n")
 
-    print(f"✅ Combined {len(combined_docs)} docs before reranking.")
-
-    # ✅ Rerank with cosine similarity
-    print("📊 Reranking with cosine similarity...")
-    docs_for_rerank = [truncate_for_rerank(doc.page_content) for doc in combined_docs]
-    doc_embeddings = batch_embed_documents_parallel_local(docs_for_rerank, max_workers=5)
-
-    query_vector_local = rerank_embedder.encode(truncate_for_rerank(cleaned_query, 1000))
-
-    # Compute cosine similarity and sort
-    sims = cosine_similarity([query_vector_local], doc_embeddings)[0]
-    scored_docs = list(zip(combined_docs, sims))
-    scored_docs.sort(key=lambda x: x[1], reverse=True)
-    reranked_docs = [doc for doc, _ in scored_docs]
-
-    print("Top 5 reranked docs preview:")
-    for i, (doc, score) in enumerate(scored_docs[:5]):
-        print(f"{i + 1}. ({score:.4f}) {doc.page_content[:150]}...\n")
-
-    # Build context after reranking
-    context_build_start = time.time()
     context = truncate_context_to_token_limit(reranked_docs)
-    print(f"⏱️ Context building took {time.time() - context_build_start:.2f}s")
 
     retrieval_end_time = time.time()
     response = generate_response_from_context(query, context, retrieval_end_time)
-
     print(f"✅ Total query time: {time.time() - total_start:.2f}s")
     return response
 
